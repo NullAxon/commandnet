@@ -1,27 +1,41 @@
 import pytest_asyncio
 import asyncio
 from commandnet import Persistence, EventBus, Event
+from typing import Any
 
 class TestDB(Persistence):
     def __init__(self):
         self.agents = {}
         self.sub_agents = {}
         self.task_groups = {}
+        self.locks = {}
+        
+    async def _get_lock(self, agent_id: str):
+        if agent_id not in self.locks:
+            self.locks[agent_id] = asyncio.Lock()
+        return self.locks[agent_id]
 
     async def load_and_lock_agent(self, agent_id: str):
-        if "#" in agent_id:
-            agent = self.sub_agents.get(agent_id)
-        else:
-            agent = self.agents.get(agent_id)
-        if not agent: return None, None
+        lock = await self._get_lock(agent_id)
+        await lock.acquire()
+        agent = self.sub_agents.get(agent_id) if "#" in agent_id else self.agents.get(agent_id)
+        if not agent: 
+            lock.release()
+            return None, None
         return agent.get("node"), agent.get("context")
+        
+    async def unlock_agent(self, agent_id: str):
+        lock = await self._get_lock(agent_id)
+        if lock.locked(): lock.release()
 
     async def save_state(self, agent_id: str, node_name: str, context: dict, event: Event):
         self.agents[agent_id] = {"node": node_name, "context": context}
+        await self.unlock_agent(agent_id)
 
     async def save_sub_state(self, sub_id: str, parent_id: str, node_name: str, ctx: dict, evt: Event):
         path = sub_id.split("#")[1]
         self.sub_agents[sub_id] = {"parent_id": parent_id, "path": path, "node": node_name, "context": ctx}
+        await self.unlock_agent(sub_id)
 
     async def create_task_group(self, parent_id: str, join_node_name: str, task_count: int):
         self.task_groups[parent_id] = {"join_node": join_node_name, "pending": task_count}
@@ -46,13 +60,11 @@ class TestDB(Persistence):
         self.agents[parent_id] = {"node": "Recomposing", "context": parent_ctx}
         return parent_ctx
 
-    # --- Added implementations for new Scheduling ABC methods ---
     async def schedule_event(self, event: Event) -> bool:
         return True
 
     async def pop_due_events(self) -> list:
         return []
-
 
 class TestBus(EventBus):
     def __init__(self):

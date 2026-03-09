@@ -3,10 +3,10 @@ from typing import Dict, Optional, Tuple, Callable, Coroutine, List
 from datetime import datetime, timezone
 from pydantic import BaseModel
 
-from commandnet import Node, Engine, Event, Persistence, EventBus, Schedule
+from commandnet import Node, Engine, Event, Persistence, EventBus, Schedule, GraphAnalyzer
 
 # ============================================================================
-# 1. Infrastructure Mock
+# 1. Infrastructure Mock (With dead-lock prevention and backpressure support)
 # ============================================================================
 
 class InMemoryDB(Persistence):
@@ -17,7 +17,6 @@ class InMemoryDB(Persistence):
         self.locks: Dict[str, asyncio.Lock] = {}
         self._global_lock = asyncio.Lock()
         
-        # --- Scheduling Mocks ---
         self.scheduled_queue: List[Event] = []
         self.idempotency_store = set()
         
@@ -36,16 +35,18 @@ class InMemoryDB(Persistence):
             return None, None
         return agent.get("node"), agent.get("context")
 
-    async def save_state(self, agent_id: str, node_name: str, context: Dict, event: Optional[Event]):
-        self.agents[agent_id] = {"node": node_name, "context": context}
+    async def unlock_agent(self, agent_id: str):
         lock = await self._get_lock(agent_id)
         if lock.locked(): lock.release()
+
+    async def save_state(self, agent_id: str, node_name: str, context: Dict, event: Optional[Event]):
+        self.agents[agent_id] = {"node": node_name, "context": context}
+        await self.unlock_agent(agent_id)
 
     async def save_sub_state(self, sub_id: str, parent_id: str, node_name: str, ctx: dict, evt: Optional[Event]):
         path = sub_id.split("#")[1]
         self.sub_agents[sub_id] = {"parent_id": parent_id, "path": path, "node": node_name, "context": ctx}
-        lock = await self._get_lock(sub_id)
-        if lock.locked(): lock.release()
+        await self.unlock_agent(sub_id)
 
     async def create_task_group(self, parent_id: str, join_node_name: str, task_count: int):
         self.task_groups[parent_id] = {"join_node": join_node_name, "pending": task_count}
@@ -70,7 +71,6 @@ class InMemoryDB(Persistence):
         self.agents[parent_id]["context"] = parent_ctx
         return parent_ctx
 
-    # --- New Scheduling Implementations ---
     async def schedule_event(self, event: Event) -> bool:
         if event.idempotency_key:
             lookup = f"{event.agent_id}:{event.idempotency_key}"
@@ -84,14 +84,16 @@ class InMemoryDB(Persistence):
         return True
 
     async def pop_due_events(self) -> List[Event]:
-        now = datetime.now(timezone.utc).isoformat()
-        due = [evt for evt in self.scheduled_queue if evt.run_at <= now]
-        self.scheduled_queue = [evt for evt in self.scheduled_queue if evt.run_at > now]
+        # Using fromisoformat correctly prevents string sort bugs on differing ISO precision
+        now = datetime.now(timezone.utc)
+        due = [evt for evt in self.scheduled_queue if datetime.fromisoformat(evt.run_at) <= now]
+        self.scheduled_queue = [evt for evt in self.scheduled_queue if datetime.fromisoformat(evt.run_at) > now]
         return due
 
 class InMemoryBus(EventBus):
     def __init__(self):
-        self.queue = asyncio.Queue()
+        # Adding backpressure to protect the event loop memory
+        self.queue = asyncio.Queue(maxsize=10000)
         self.handler = None
         self.running = True
 
@@ -110,10 +112,9 @@ class InMemoryBus(EventBus):
             if self.handler:
                 try:
                     await self.handler(event)
-                    self.queue.task_done() # <--- AT-LEAST-ONCE: Ack only on success!
+                    self.queue.task_done()
                 except Exception as e:
                     print(f"Queue Error: {e}")
-                    # In a real broker, we would NACK here so the message stays in the queue
 
 # ============================================================================
 # 2. Define State & Nodes
@@ -134,7 +135,6 @@ class PongNode(Node[PingCtx, PongMessage]):
 
 class DuplicateTestNode(Node[PingCtx, None]):
     async def run(self, ctx: PingCtx, payload=None) -> Schedule:
-        # We attempt to schedule PongNode again with the same idempotency key
         print("🏓 [DUPE TEST] Attempting to schedule duplicate pong...")
         return Schedule(
             node_cls=PongNode,
@@ -147,31 +147,27 @@ class PingNode(Node[PingCtx, None]):
     async def run(self, ctx: PingCtx, payload=None) -> Schedule:
         ctx.ping_count += 1
         print(f"🏓 [PING] Scheduling a Pong for 2 seconds from now...")
-        
-        # Schedule the future event with an Idempotency key
         return Schedule(
-            node_cls=DuplicateTestNode, # We transition to DuplicateTestNode to test blocking
+            node_cls=DuplicateTestNode, 
             delay_seconds=2,
             idempotency_key="pong_round_1"
         )
 
 
-# ============================================================================
-# 4. Setup and Run
-# ============================================================================
-
 async def main():
+    # Run Static Validation! 
+    # Ensures our types and DAG are well-formed before the engine ever starts.
+    GraphAnalyzer.validate(PingNode)
+    
     db = InMemoryDB()
     bus = InMemoryBus()
     engine = Engine(persistence=db, event_bus=bus)
     
-    # Start worker and scheduler loop (checking DB every 0.5s)
     await engine.start_worker(poll_interval=0.5)
     
     print("Triggering Agent...")
     await engine.trigger_agent("agent-schedule", PingNode, PingCtx())
     
-    # Wait for the future events to execute
     print("Waiting 3 seconds to watch scheduler...")
     await asyncio.sleep(3.0) 
     

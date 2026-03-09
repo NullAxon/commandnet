@@ -1,7 +1,7 @@
 import pytest
 import asyncio
 from pydantic import BaseModel
-from commandnet import Engine, Node
+from commandnet import Engine, Node, Event
 
 class SimpleCtx(BaseModel):
     val: int = 0
