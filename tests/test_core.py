@@ -1,21 +1,26 @@
 import pytest
+from pydantic import BaseModel
 from commandnet import GraphAnalyzer, Node
 from typing import Union, Type
 
-# Test DAG definition
-class Final(Node):
-    async def run(self, ctx):
-        return None
-class Mid(Node):
-    async def run(self, ctx) -> Final:
-        return Final()
-class Start(Node):
-    async def run(self, ctx) -> Union[Mid, Final]:
-        return Mid()
+class Ctx(BaseModel): pass
+
+class TestFinal(Node[Ctx, None]):
+    async def run(self, ctx, payload=None): return None
+
+class TestMid(Node[Ctx, None]):
+    async def run(self, ctx, payload=None) -> Type[TestFinal]: return TestFinal
+
+class TestStart(Node[Ctx, None]):
+    async def run(self, ctx, payload=None) -> Union[Type[TestMid], Type[TestFinal]]: return TestMid
 
 def test_graph_analyzer():
-    dag = GraphAnalyzer.build_graph(Start)
-    assert "Start" in dag
-    assert "Mid" in dag["Start"]
-    assert "Final" in dag["Mid"]
-    assert len(dag["Final"]) == 0
+    dag = GraphAnalyzer.build_graph(TestStart)
+    assert "TestStart" in dag
+    assert "TestMid" in dag["TestStart"]
+    assert "TestFinal" in dag["TestMid"]
+    assert len(dag["TestFinal"]) == 0
+
+def test_graph_extracts_generics():
+    c_type = GraphAnalyzer.get_context_type(TestStart)
+    assert c_type == Ctx
