@@ -46,6 +46,14 @@ class TestDB(Persistence):
         self.agents[parent_id] = {"node": "Recomposing", "context": parent_ctx}
         return parent_ctx
 
+    # --- Added implementations for new Scheduling ABC methods ---
+    async def schedule_event(self, event: Event) -> bool:
+        return True
+
+    async def pop_due_events(self) -> list:
+        return []
+
+
 class TestBus(EventBus):
     def __init__(self):
         self.queue = asyncio.Queue()

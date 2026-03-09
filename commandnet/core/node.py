@@ -9,16 +9,22 @@ NODE_REGISTRY: Dict[str, Type['Node']] = {}
 
 class ParallelTask(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)
-    
     node_cls: Type['Node']
     payload: Optional[BaseModel] = None
     sub_context_path: str 
 
 class Parallel(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)
-    
     branches: List[ParallelTask]
     join_node: Type['Node']
+
+class Schedule(BaseModel):
+    """Instructs the engine to schedule a node for future execution."""
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+    node_cls: Type['Node']
+    delay_seconds: int
+    payload: Optional[BaseModel] = None
+    idempotency_key: Optional[str] = None
 
 class Node(Generic[C, P]):
     def __init_subclass__(cls, **kwargs):
@@ -26,6 +32,5 @@ class Node(Generic[C, P]):
         if not inspect.isabstract(cls):
             NODE_REGISTRY[cls.__name__] = cls
 
-    async def run(self, ctx: C, payload: Optional[P] = None) -> Union[Type['Node'], Parallel, None]:
-        """Executes node logic. Returns the Next Node, a Parallel execution request, or None."""
+    async def run(self, ctx: C, payload: Optional[P] = None) -> Union[Type['Node'], Parallel, Schedule, None]:
         pass

@@ -1,5 +1,5 @@
 from abc import ABC, abstractmethod
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, Tuple, List
 from ..core.models import Event
 
 class Persistence(ABC):
@@ -32,4 +32,17 @@ class Persistence(ABC):
     @abstractmethod
     async def recompose_parent(self, parent_id: str) -> dict:
         """Merges all sub-context rows back into the main parent dictionary."""
+        pass
+
+    @abstractmethod
+    async def schedule_event(self, event: Event) -> bool:
+        """
+        Saves an event for future execution. 
+        Returns False if the idempotency_key already exists for this agent_id (At-Most-Once).
+        """
+        pass
+
+    @abstractmethod
+    async def pop_due_events(self) -> List[Event]:
+        """Returns and deletes events from the DB where run_at <= NOW()."""
         pass

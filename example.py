@@ -1,21 +1,25 @@
 import asyncio
-from typing import Dict, Optional, Tuple, Callable, Coroutine
-from pydantic import BaseModel, Field
+from typing import Dict, Optional, Tuple, Callable, Coroutine, List
+from datetime import datetime, timezone
+from pydantic import BaseModel
 
-from commandnet import Node, Engine, Event, Persistence, EventBus, Parallel, ParallelTask
+from commandnet import Node, Engine, Event, Persistence, EventBus, Schedule
 
 # ============================================================================
-# 1. Infrastructure Mocks (In-Memory Database & Message Queue)
+# 1. Infrastructure Mock
 # ============================================================================
 
 class InMemoryDB(Persistence):
-    """A thread-safe, in-memory mock of a database with Sub-Context support."""
     def __init__(self):
         self.agents: Dict[str, Dict] = {}       
         self.sub_agents: Dict[str, Dict] = {}   
         self.task_groups: Dict[str, Dict] = {}  
         self.locks: Dict[str, asyncio.Lock] = {}
         self._global_lock = asyncio.Lock()
+        
+        # --- Scheduling Mocks ---
+        self.scheduled_queue: List[Event] = []
+        self.idempotency_store = set()
         
     async def _get_lock(self, agent_id: str) -> asyncio.Lock:
         async with self._global_lock:
@@ -26,12 +30,7 @@ class InMemoryDB(Persistence):
     async def load_and_lock_agent(self, agent_id: str) -> Tuple[Optional[str], Optional[Dict]]:
         lock = await self._get_lock(agent_id)
         await lock.acquire()
-        
-        if "#" in agent_id:
-            agent = self.sub_agents.get(agent_id)
-        else:
-            agent = self.agents.get(agent_id)
-            
+        agent = self.sub_agents.get(agent_id) if "#" in agent_id else self.agents.get(agent_id)
         if not agent:
             lock.release()
             return None, None
@@ -40,15 +39,13 @@ class InMemoryDB(Persistence):
     async def save_state(self, agent_id: str, node_name: str, context: Dict, event: Optional[Event]):
         self.agents[agent_id] = {"node": node_name, "context": context}
         lock = await self._get_lock(agent_id)
-        if lock.locked():
-            lock.release()
+        if lock.locked(): lock.release()
 
     async def save_sub_state(self, sub_id: str, parent_id: str, node_name: str, ctx: dict, evt: Optional[Event]):
         path = sub_id.split("#")[1]
         self.sub_agents[sub_id] = {"parent_id": parent_id, "path": path, "node": node_name, "context": ctx}
         lock = await self._get_lock(sub_id)
-        if lock.locked():
-            lock.release()
+        if lock.locked(): lock.release()
 
     async def create_task_group(self, parent_id: str, join_node_name: str, task_count: int):
         self.task_groups[parent_id] = {"join_node": join_node_name, "pending": task_count}
@@ -57,7 +54,6 @@ class InMemoryDB(Persistence):
         parent_id = sub_id.split("#")[0]
         group = self.task_groups.get(parent_id)
         if not group: return None
-        
         group["pending"] -= 1
         if group["pending"] <= 0:
             join_node = group["join_node"]
@@ -69,26 +65,40 @@ class InMemoryDB(Persistence):
         parent_ctx = self.agents.get(parent_id, {}).get("context", {})
         for sub_id, data in list(self.sub_agents.items()):
             if data["parent_id"] == parent_id:
-                path = data["path"]
-                parent_ctx[path] = data["context"]
+                parent_ctx[data["path"]] = data["context"]
                 del self.sub_agents[sub_id]
-                
         self.agents[parent_id]["context"] = parent_ctx
         return parent_ctx
+
+    # --- New Scheduling Implementations ---
+    async def schedule_event(self, event: Event) -> bool:
+        if event.idempotency_key:
+            lookup = f"{event.agent_id}:{event.idempotency_key}"
+            if lookup in self.idempotency_store:
+                print(f"   [DB] 🛑 Blocked duplicate schedule: {lookup}")
+                return False
+            self.idempotency_store.add(lookup)
+            
+        print(f"   [DB] 📅 Scheduled {event.node_name} for {event.run_at}")
+        self.scheduled_queue.append(event)
+        return True
+
+    async def pop_due_events(self) -> List[Event]:
+        now = datetime.now(timezone.utc).isoformat()
+        due = [evt for evt in self.scheduled_queue if evt.run_at <= now]
+        self.scheduled_queue = [evt for evt in self.scheduled_queue if evt.run_at > now]
+        return due
 
 class InMemoryBus(EventBus):
     def __init__(self):
         self.queue = asyncio.Queue()
-        self.handler: Optional[Callable[[Event], Coroutine]] = None
+        self.handler = None
         self.running = True
 
-    async def publish(self, event: Event):
-        await self.queue.put(event)
-
-    async def subscribe(self, handler: Callable[[Event], Coroutine]):
+    async def publish(self, event: Event): await self.queue.put(event)
+    async def subscribe(self, handler):
         self.handler = handler
         asyncio.create_task(self._consume())
-
     async def stop(self):
         self.running = False
         await self.queue.put(None)
@@ -100,66 +110,51 @@ class InMemoryBus(EventBus):
             if self.handler:
                 try:
                     await self.handler(event)
+                    self.queue.task_done() # <--- AT-LEAST-ONCE: Ack only on success!
                 except Exception as e:
-                    print(f"Queue Handler Error: {e}")
-            self.queue.task_done()
+                    print(f"Queue Error: {e}")
+                    # In a real broker, we would NACK here so the message stays in the queue
 
 # ============================================================================
-# 2. Define State (Context) & Payloads
+# 2. Define State & Nodes
 # ============================================================================
 
-class DocumentSection(BaseModel):
-    text: str = ""
-    summary: str = ""
-    processed: bool = False
+class PingCtx(BaseModel):
+    ping_count: int = 0
+    pong_count: int = 0
 
-class DocContext(BaseModel):
-    intro: DocumentSection = Field(default_factory=DocumentSection)
-    body: DocumentSection = Field(default_factory=DocumentSection)
-    final_report: str = ""
+class PongMessage(BaseModel):
+    text: str
 
-class ProcessingPayload(BaseModel):
-    focus_keyword: str
-
-# ============================================================================
-# 3. Define Nodes (Parallel Execution)
-# ============================================================================
-
-class SummarizeSection(Node[DocumentSection, ProcessingPayload]):
-    async def run(self, ctx: DocumentSection, payload: Optional[ProcessingPayload] = None) -> None:
-        focus = payload.focus_keyword if payload else "general"
-        print(f"   [Worker] Summarizing '{ctx.text[:10]}...' with focus: {focus}")
-        # Artificial delay to simulate processing overhead
-        await asyncio.sleep(0.1) 
-        ctx.summary = f"Summary of '{ctx.text}' (Focus: {focus})"
-        ctx.processed = True
-        return None # Terminal for this sub-context
-
-class FinalJoin(Node[DocContext, None]):
-    async def run(self, ctx: DocContext, payload=None) -> None:
-        print("\n--- Final Join Node ---")
-        ctx.final_report = f"INTRO: [{ctx.intro.summary}] | BODY: [{ctx.body.summary}]"
-        print(f"Report Generated: {ctx.final_report}")
+class PongNode(Node[PingCtx, PongMessage]):
+    async def run(self, ctx: PingCtx, payload: PongMessage) -> None:
+        ctx.pong_count += 1
+        print(f"🎾 [PONG] Received delayed message: '{payload.text}' (Pong Count: {ctx.pong_count})")
         return None
 
-class StartNode(Node[DocContext, None]):
-    async def run(self, ctx: DocContext, payload=None) -> Parallel:
-        print("--- Dispatching Parallel Tasks ---")
-        return Parallel(
-            branches=[
-                ParallelTask(
-                    node_cls=SummarizeSection, 
-                    sub_context_path="intro", 
-                    payload=ProcessingPayload(focus_keyword="hook")
-                ),
-                ParallelTask(
-                    node_cls=SummarizeSection, 
-                    sub_context_path="body",
-                    payload=ProcessingPayload(focus_keyword="details")
-                ),
-            ],
-            join_node=FinalJoin
+class DuplicateTestNode(Node[PingCtx, None]):
+    async def run(self, ctx: PingCtx, payload=None) -> Schedule:
+        # We attempt to schedule PongNode again with the same idempotency key
+        print("🏓 [DUPE TEST] Attempting to schedule duplicate pong...")
+        return Schedule(
+            node_cls=PongNode,
+            delay_seconds=1,
+            payload=PongMessage(text="I should be blocked!"),
+            idempotency_key="pong_round_1"
         )
+
+class PingNode(Node[PingCtx, None]):
+    async def run(self, ctx: PingCtx, payload=None) -> Schedule:
+        ctx.ping_count += 1
+        print(f"🏓 [PING] Scheduling a Pong for 2 seconds from now...")
+        
+        # Schedule the future event with an Idempotency key
+        return Schedule(
+            node_cls=DuplicateTestNode, # We transition to DuplicateTestNode to test blocking
+            delay_seconds=2,
+            idempotency_key="pong_round_1"
+        )
+
 
 # ============================================================================
 # 4. Setup and Run
@@ -170,22 +165,17 @@ async def main():
     bus = InMemoryBus()
     engine = Engine(persistence=db, event_bus=bus)
     
-    await engine.start_worker()
+    # Start worker and scheduler loop (checking DB every 0.5s)
+    await engine.start_worker(poll_interval=0.5)
     
-    initial_ctx = DocContext(
-        intro=DocumentSection(text="Once upon a time..."),
-        body=DocumentSection(text="The hero fought the dragon...")
-    )
+    print("Triggering Agent...")
+    await engine.trigger_agent("agent-schedule", PingNode, PingCtx())
     
-    print("Triggering Document Analysis Agent...")
-    await engine.trigger_agent(
-        agent_id="doc-agent-001", 
-        start_node=StartNode, 
-        initial_context=initial_ctx
-    )
+    # Wait for the future events to execute
+    print("Waiting 3 seconds to watch scheduler...")
+    await asyncio.sleep(3.0) 
     
-    # Wait longer to ensure all workers finish their tasks
-    await asyncio.sleep(1.0) 
+    await engine.stop()
     await bus.stop()
 
 if __name__ == "__main__":
