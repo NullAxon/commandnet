@@ -1,23 +1,41 @@
 import asyncio
 import logging
 from datetime import datetime, timezone, timedelta
-from typing import Optional, Type
+from typing import Optional, Type, Iterable, Dict
 from pydantic import BaseModel
 
 from ..core.models import Event
-from ..core.node import Node, NODE_REGISTRY, Parallel, Schedule
+from ..core.node import Node, Parallel, Schedule
 from ..core.graph import GraphAnalyzer
 from ..interfaces.persistence import Persistence
 from ..interfaces.event_bus import EventBus
 from ..interfaces.observer import Observer
 
 class Engine:
-    def __init__(self, persistence: Persistence, event_bus: EventBus, observer: Optional[Observer] = None):
+    def __init__(
+        self, 
+        persistence: Persistence, 
+        event_bus: EventBus, 
+        nodes: Iterable[Type[Node]],
+        observer: Optional[Observer] = None
+    ):
         self.db = persistence
         self.bus = event_bus
         self.observer = observer or Observer()
         self.logger = logging.getLogger("CommandNet")
         self._scheduler_task: Optional[asyncio.Task] = None
+        
+        # Build Engine-scoped registry
+        self._registry: Dict[str, Type[Node]] = {}
+        for node_cls in nodes:
+            name = node_cls.get_node_name()
+            if name in self._registry and self._registry[name] is not node_cls:
+                raise RuntimeError(f"Node name collision in Engine: '{name}'")
+            self._registry[name] = node_cls
+
+    def validate_graph(self, start_node: Type[Node]):
+        """Helper to validate the graph using this engine's registry."""
+        return GraphAnalyzer.validate(start_node, self._registry)
 
     async def start_worker(self, poll_interval: float = 1.0):
         await self.bus.subscribe(self.process_event)
@@ -46,6 +64,9 @@ class Engine:
 
     async def trigger_agent(self, agent_id: str, start_node: Type[Node], initial_context: BaseModel, payload: Optional[BaseModel] = None):
         node_name = start_node.get_node_name()
+        if node_name not in self._registry:
+            raise ValueError(f"Node '{node_name}' is not registered with this Engine.")
+            
         start_event = Event(
             agent_id=agent_id, 
             node_name=node_name,
@@ -64,6 +85,7 @@ class Engine:
         locked = True
         try:
             if current_node_name != event.node_name:
+                # Same logic as before for sub-state/state
                 if "#" in event.agent_id:
                     parent_id = event.agent_id.split("#")[0]
                     await self.db.save_sub_state(event.agent_id, parent_id, current_node_name, ctx_dict, None)
@@ -72,9 +94,9 @@ class Engine:
                 locked = False
                 return
 
-            node_cls = NODE_REGISTRY.get(current_node_name)
+            node_cls = self._registry.get(current_node_name)
             if not node_cls:
-                raise RuntimeError(f"Node '{current_node_name}' missing from registry.")
+                raise RuntimeError(f"Node '{current_node_name}' not found in this Engine's registry.")
             
             ctx_type = GraphAnalyzer.get_context_type(node_cls)
             payload_type = GraphAnalyzer.get_payload_type(node_cls)
@@ -101,20 +123,22 @@ class Engine:
             else:
                 await self._handle_terminal(event.agent_id, current_node_name, ctx, duration)
                 
-            locked = False # Success! The handle_* methods performed a save_state, which released the lock.
+            locked = False 
             
         except Exception as e:
             await self.observer.on_error(event.agent_id, current_node_name, e)
             raise
         finally:
             if locked:
-                # Deadlock prevention: Exception occurred before state was saved
                 await self.db.unlock_agent(event.agent_id)
 
+    # Remaining _handle_* methods use self._registry and self.validate_graph
     async def _handle_transition(self, agent_id: str, from_node: str, next_node_cls: Type[Node], ctx: BaseModel, duration: float):
         next_name = next_node_cls.get_node_name()
+        if next_name not in self._registry:
+            raise RuntimeError(f"Transition target '{next_name}' not in registry.")
+            
         await self.observer.on_transition(agent_id, from_node, next_name, duration)
-        
         next_event = Event(agent_id=agent_id, node_name=next_name)
         await self.db.save_state(agent_id, next_name, ctx.model_dump(), next_event)
         await self.bus.publish(next_event)
@@ -122,33 +146,31 @@ class Engine:
     async def _handle_parallel_start(self, parent_id: str, parent_ctx: BaseModel, parallel: Parallel, duration: float):
         join_name = parallel.join_node.get_node_name()
         await self.observer.on_transition(parent_id, "ParallelStart", join_name, duration)
-        
         await self.db.create_task_group(parent_id=parent_id, join_node_name=join_name, task_count=len(parallel.branches))
         
         for task in parallel.branches:
             if not hasattr(parent_ctx, task.sub_context_path):
-                raise RuntimeError(f"Context missing path: '{task.sub_context_path}'. Cannot fan out.")
+                raise RuntimeError(f"Context missing path: '{task.sub_context_path}'.")
                 
             sub_ctx = getattr(parent_ctx, task.sub_context_path)
             sub_id = f"{parent_id}#{task.sub_context_path}"
+            node_name = task.node_cls.get_node_name()
             
             evt = Event(
                 agent_id=sub_id, 
-                node_name=task.node_cls.get_node_name(),
+                node_name=node_name,
                 payload=task.payload.model_dump() if hasattr(task.payload, "model_dump") else task.payload
             )
-            await self.db.save_sub_state(sub_id, parent_id, task.node_cls.get_node_name(), sub_ctx.model_dump(), evt)
+            await self.db.save_sub_state(sub_id, parent_id, node_name, sub_ctx.model_dump(), evt)
             await self.bus.publish(evt)
             
         await self.db.save_state(parent_id, "WAITING_FOR_JOIN", parent_ctx.model_dump(), None)
 
     async def _handle_terminal(self, agent_id: str, from_node: str, ctx: BaseModel, duration: float):
         await self.observer.on_transition(agent_id, from_node, "TERMINAL", duration)
-        
         if "#" in agent_id:
             parent_id = agent_id.split("#")[0]
             await self.db.save_sub_state(agent_id, parent_id, "TERMINAL", ctx.model_dump(), None)
-            
             join_node_name = await self.db.register_sub_task_completion(agent_id)
             if join_node_name:
                 await self._trigger_recompose(parent_id, join_node_name)
@@ -158,7 +180,6 @@ class Engine:
     async def _handle_schedule(self, agent_id: str, from_node: str, ctx: BaseModel, schedule: Schedule, duration: float):
         target_name = schedule.node_cls.get_node_name()
         await self.observer.on_transition(agent_id, from_node, f"SCHEDULED:{target_name}", duration)
-        
         run_at_dt = datetime.now(timezone.utc) + timedelta(seconds=schedule.delay_seconds)
         
         evt = Event(
@@ -175,7 +196,6 @@ class Engine:
         if "#" in agent_id:
             parent_id = agent_id.split("#")[0]
             await self.db.save_sub_state(agent_id, parent_id, next_node, ctx.model_dump(), None)
-            
             if not scheduled:
                 join_node_name = await self.db.register_sub_task_completion(agent_id)
                 if join_node_name:

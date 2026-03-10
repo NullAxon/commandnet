@@ -19,7 +19,7 @@ class TestSimpleStartNode(Node[SimpleCtx, None]):
 @pytest.mark.asyncio
 async def test_engine_execution_flow(mock_infrastructure):
     db, bus = mock_infrastructure
-    engine = Engine(persistence=db, event_bus=bus)
+    engine = Engine(persistence=db, event_bus=bus, nodes=[TestSimpleStartNode, TestSimpleNextNode])
     await engine.start_worker()
 
     ctx = SimpleCtx()

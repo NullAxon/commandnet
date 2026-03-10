@@ -155,13 +155,13 @@ class PingNode(Node[PingCtx, None]):
 
 
 async def main():
-    # Run Static Validation! 
-    # Ensures our types and DAG are well-formed before the engine ever starts.
-    GraphAnalyzer.validate(PingNode)
-    
     db = InMemoryDB()
     bus = InMemoryBus()
-    engine = Engine(persistence=db, event_bus=bus)
+
+    my_nodes = [PingNode, PongNode, DuplicateTestNode]
+    engine = Engine(persistence=db, event_bus=bus, nodes=my_nodes)
+
+    engine.validate_graph(PingNode)
     
     await engine.start_worker(poll_interval=0.5)
     
