@@ -1,7 +1,7 @@
 import pytest_asyncio
 import asyncio
 from commandnet import Persistence, EventBus, Event
-from typing import Any
+from typing import Any, Dict, List, Any
 
 class TestDB(Persistence):
     def __init__(self):
@@ -9,6 +9,7 @@ class TestDB(Persistence):
         self.sub_agents = {}
         self.task_groups = {}
         self.locks = {}
+        self.waiting_room: Dict[str, List[Dict]] = {}
         
     async def _get_lock(self, agent_id: str):
         if agent_id not in self.locks:
@@ -65,6 +66,18 @@ class TestDB(Persistence):
 
     async def pop_due_events(self) -> list:
         return []
+
+    async def park_agent(self, agent_id: str, signal_id: str, next_target: Any, context: Dict):
+        if signal_id not in self.waiting_room: self.waiting_room[signal_id] = []
+        self.waiting_room[signal_id].append({
+            "agent_id": agent_id,
+            "next_target": next_target,
+            "context": context
+        })
+        await self.unlock_agent(agent_id)
+
+    async def get_and_clear_waiters(self, signal_id: str) -> List[Dict]:
+        return self.waiting_room.pop(signal_id, [])
 
 class TestBus(EventBus):
     def __init__(self):

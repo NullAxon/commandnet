@@ -1,5 +1,5 @@
 from abc import ABC, abstractmethod
-from typing import Dict, Optional, Tuple, List
+from typing import Dict, Optional, Tuple, List, Any
 from ..core.models import Event
 
 class Persistence(ABC):
@@ -38,4 +38,12 @@ class Persistence(ABC):
 
     @abstractmethod
     async def pop_due_events(self) -> List[Event]:
+        pass
+
+    @abstractmethod
+    async def park_agent(self, agent_id: str, signal_id: str, next_target: Any, context: Dict):
+        pass
+
+    @abstractmethod
+    async def get_and_clear_waiters(self, signal_id: str) -> List[Dict]:
         pass

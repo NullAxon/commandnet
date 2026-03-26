@@ -1,5 +1,5 @@
 from .core.models import Event
-from .core.node import Node, Parallel, ParallelTask, Schedule
+from .core.node import Node, Parallel, ParallelTask, Schedule, Wait
 from .core.graph import GraphAnalyzer
 from .interfaces.persistence import Persistence
 from .interfaces.event_bus import EventBus

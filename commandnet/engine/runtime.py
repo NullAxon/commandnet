@@ -1,52 +1,255 @@
 import asyncio
 import logging
 from datetime import datetime, timezone, timedelta
-from typing import Optional, Type, Iterable, Dict
+from typing import Optional, Type, Iterable, Dict, Any, Union
 from pydantic import BaseModel
 
 from ..core.models import Event
-from ..core.node import Node, Parallel, Schedule
+from ..core.node import Node, Parallel, Schedule, Wait, Target, ParallelTask
 from ..core.graph import GraphAnalyzer
 from ..interfaces.persistence import Persistence
 from ..interfaces.event_bus import EventBus
 from ..interfaces.observer import Observer
 
+
 class Engine:
     def __init__(
-        self, 
-        persistence: Persistence, 
-        event_bus: EventBus, 
+        self,
+        persistence: Persistence,
+        event_bus: EventBus,
         nodes: Iterable[Type[Node]],
-        observer: Optional[Observer] = None
+        observer: Optional[Observer] = None,
     ):
         self.db = persistence
         self.bus = event_bus
         self.observer = observer or Observer()
         self.logger = logging.getLogger("CommandNet")
         self._scheduler_task: Optional[asyncio.Task] = None
-        
-        # Build Engine-scoped registry
-        self._registry: Dict[str, Type[Node]] = {}
-        for node_cls in nodes:
-            name = node_cls.get_node_name()
-            if name in self._registry and self._registry[name] is not node_cls:
-                raise RuntimeError(f"Node name collision in Engine: '{name}'")
-            self._registry[name] = node_cls
 
-    def validate_graph(self, start_node: Type[Node]):
-        """Helper to validate the graph using this engine's registry."""
-        return GraphAnalyzer.validate(start_node, self._registry)
+        self._registry: Dict[str, Type[Node]] = {n.get_node_name(): n for n in nodes}
+
+    # --- HELPER UTILITIES ---
+
+    def _dump_ctx(self, ctx: Any) -> dict:
+        """Helper to safely dump context whether it's a model or a dict."""
+        if hasattr(ctx, "model_dump"):
+            return ctx.model_dump()
+        return ctx
+
+    def _get_path(self, obj: Any, path: str) -> Any:
+        """Helper to get a value from an object or a dict."""
+        if isinstance(obj, dict):
+            return obj.get(path)
+        return getattr(obj, path)
+
+    # --- CORE RECURSIVE RESOLVER ---
+
+    async def _apply_target(
+        self,
+        agent_id: str,
+        context: Any,
+        target: Target,
+        duration: float = 0.0,
+        payload: Any = None,
+    ):
+        # 1. Terminal State
+        if target is None:
+            await self.observer.on_transition(agent_id, "RUN", "TERMINAL", duration)
+            ctx_dict = self._dump_ctx(context)
+            if "#" in agent_id:
+                parent_id = agent_id.split("#")[0]
+                await self.db.save_sub_state(
+                    agent_id, parent_id, "TERMINAL", ctx_dict, None
+                )
+                join_node_name = await self.db.register_sub_task_completion(agent_id)
+                if join_node_name:
+                    await self._trigger_recompose(parent_id, join_node_name)
+            else:
+                await self.db.save_state(agent_id, "TERMINAL", ctx_dict, None)
+            return
+
+        # 2. Node Class Transition
+        if isinstance(target, type) and issubclass(target, Node):
+            node_name = target.get_node_name()
+            await self.observer.on_transition(agent_id, "RUN", node_name, duration)
+
+            p_load = payload.model_dump() if hasattr(payload, "model_dump") else payload
+            evt = Event(agent_id=agent_id, node_name=node_name, payload=p_load)
+            ctx_dict = self._dump_ctx(context)
+
+            if "#" in agent_id:
+                await self.db.save_sub_state(
+                    agent_id, agent_id.split("#")[0], node_name, ctx_dict, evt
+                )
+            else:
+                await self.db.save_state(agent_id, node_name, ctx_dict, evt)
+
+            await self.bus.publish(evt)
+            return
+
+        # 3. Wait Directive
+        if isinstance(target, Wait):
+            actual_id = agent_id
+            actual_ctx = context
+            if target.sub_context_path and "#" not in agent_id:
+                actual_id = f"{agent_id}#{target.sub_context_path}"
+                actual_ctx = self._get_path(context, target.sub_context_path)
+
+            await self.observer.on_transition(
+                actual_id, "RUN", f"WAIT:{target.signal_id}", duration
+            )
+            await self.db.park_agent(
+                actual_id,
+                target.signal_id,
+                target.resume_action,
+                self._dump_ctx(actual_ctx),
+            )
+            return
+
+        # 4. Parallel Directive
+        if isinstance(target, Parallel):
+            join_name = target.join_node.get_node_name() if target.join_node else "FORK"
+            await self.observer.on_transition(
+                agent_id, "RUN", f"PARALLEL:{join_name}", duration
+            )
+
+            if target.join_node:
+                await self.db.create_task_group(
+                    agent_id, join_name, len(target.branches)
+                )
+
+            for branch in target.branches:
+                task = (
+                    branch
+                    if isinstance(branch, ParallelTask)
+                    else ParallelTask(
+                        action=branch,
+                        sub_context_path=branch.sub_context_path,  # type: ignore
+                    )
+                )
+                sub_ctx = self._get_path(context, task.sub_context_path)
+                await self._apply_target(
+                    f"{agent_id}#{task.sub_context_path}",
+                    sub_ctx,
+                    task.action,
+                    duration=0,
+                    payload=task.payload,
+                )
+
+            if target.join_node:
+                await self.db.save_state(
+                    agent_id, "WAITING_FOR_JOIN", self._dump_ctx(context), None
+                )
+            else:
+                await self._apply_target(agent_id, context, None)
+            return
+
+        # 5. Schedule Directive
+        if isinstance(target, Schedule):
+            if isinstance(target.action, type) and issubclass(target.action, Node):
+                target_node_name = target.action.get_node_name()
+            else:
+                raise TypeError("Schedule.action must be a Node class.")
+
+            await self.observer.on_transition(
+                agent_id, "RUN", f"SCHEDULED:{target_node_name}", duration
+            )
+            run_at_dt = datetime.now(timezone.utc) + timedelta(
+                seconds=target.delay_seconds
+            )
+            p_load = (
+                target.payload.model_dump()
+                if hasattr(target.payload, "model_dump")
+                else target.payload
+            )
+
+            scheduled_evt = Event(
+                agent_id=agent_id,
+                node_name=target_node_name,
+                payload=p_load,
+                run_at=run_at_dt.isoformat(),
+                idempotency_key=target.idempotency_key,
+            )
+
+            await self.db.schedule_event(scheduled_evt)
+            await self.db.save_state(
+                agent_id, target_node_name, self._dump_ctx(context), None
+            )
+            return
+
+    # --- WORKER & EXTERNAL TRIGGERS ---
+
+    async def process_event(self, event: Event):
+        start_time = asyncio.get_event_loop().time()
+        agent_id = event.agent_id
+        current_node_name, ctx_dict = await self.db.load_and_lock_agent(agent_id)
+
+        if not current_node_name:
+            return
+
+        try:
+            if current_node_name != event.node_name:
+                return
+
+            node_cls = self._registry.get(current_node_name)
+            if not node_cls:
+                raise RuntimeError(f"Node '{current_node_name}' not found.")
+
+            ctx_type = GraphAnalyzer.get_context_type(node_cls)
+            payload_type = GraphAnalyzer.get_payload_type(node_cls)
+
+            ctx = (
+                ctx_type.model_validate(ctx_dict)
+                if issubclass(ctx_type, BaseModel)
+                else ctx_dict
+            )
+            payload = (
+                payload_type.model_validate(event.payload)
+                if (event.payload and issubclass(payload_type, BaseModel))
+                else event.payload
+            )
+
+            result = await node_cls().run(ctx, payload)
+            await self._apply_target(
+                agent_id,
+                ctx,
+                result,
+                (asyncio.get_event_loop().time() - start_time) * 1000,
+            )
+
+        except Exception as e:
+            await self.observer.on_error(agent_id, current_node_name, e)
+            raise
+        finally:
+            await self.db.unlock_agent(agent_id)
+
+    async def release_signal(self, signal_id: str, payload: Any = None):
+        waiters = await self.db.get_and_clear_waiters(signal_id)
+        for waiter in waiters:
+            agent_id = waiter["agent_id"]
+            await self.db.load_and_lock_agent(agent_id)
+            try:
+                await self._apply_target(
+                    agent_id=agent_id,
+                    context=waiter["context"],
+                    target=waiter["next_target"],
+                    payload=payload,
+                )
+            finally:
+                await self.db.unlock_agent(agent_id)
+
+    # --- LIFECYCLE METHODS ---
 
     async def start_worker(self, poll_interval: float = 1.0):
         await self.bus.subscribe(self.process_event)
         self._scheduler_task = asyncio.create_task(self._scheduler_loop(poll_interval))
-        self.logger.info("Worker and Scheduler started.")
+        self.logger.info("Worker started.")
 
     async def _scheduler_loop(self, poll_interval: float):
         while True:
             try:
-                due_events = await self.db.pop_due_events()
-                for evt in due_events:
+                due = await self.db.pop_due_events()
+                for evt in due:
                     await self.bus.publish(evt)
             except asyncio.CancelledError:
                 break
@@ -62,150 +265,28 @@ class Engine:
             except asyncio.CancelledError:
                 pass
 
-    async def trigger_agent(self, agent_id: str, start_node: Type[Node], initial_context: BaseModel, payload: Optional[BaseModel] = None):
+    async def trigger_agent(
+        self,
+        agent_id: str,
+        start_node: Type[Node],
+        initial_context: BaseModel,
+        payload: Optional[BaseModel] = None,
+    ):
         node_name = start_node.get_node_name()
-        if node_name not in self._registry:
-            raise ValueError(f"Node '{node_name}' is not registered with this Engine.")
-            
-        start_event = Event(
-            agent_id=agent_id, 
-            node_name=node_name,
-            payload=payload.model_dump() if hasattr(payload, "model_dump") else payload
-        )
-        await self.db.save_state(agent_id, node_name, initial_context.model_dump(), start_event)
-        await self.bus.publish(start_event)
-
-    async def process_event(self, event: Event):
-        start_time = asyncio.get_event_loop().time()
-        
-        current_node_name, ctx_dict = await self.db.load_and_lock_agent(event.agent_id)
-        if not current_node_name:
-            return
-
-        locked = True
-        try:
-            if current_node_name != event.node_name:
-                # Same logic as before for sub-state/state
-                if "#" in event.agent_id:
-                    parent_id = event.agent_id.split("#")[0]
-                    await self.db.save_sub_state(event.agent_id, parent_id, current_node_name, ctx_dict, None)
-                else:
-                    await self.db.save_state(event.agent_id, current_node_name, ctx_dict, None)
-                locked = False
-                return
-
-            node_cls = self._registry.get(current_node_name)
-            if not node_cls:
-                raise RuntimeError(f"Node '{current_node_name}' not found in this Engine's registry.")
-            
-            ctx_type = GraphAnalyzer.get_context_type(node_cls)
-            payload_type = GraphAnalyzer.get_payload_type(node_cls)
-            
-            ctx = ctx_type.model_validate(ctx_dict) if issubclass(ctx_type, BaseModel) else ctx_dict
-            
-            payload = None
-            if event.payload is not None:
-                if isinstance(payload_type, type) and issubclass(payload_type, BaseModel):
-                    payload = payload_type.model_validate(event.payload)
-                else:
-                    payload = event.payload
-
-            node_instance = node_cls()
-            result = await node_instance.run(ctx, payload)
-            duration = (asyncio.get_event_loop().time() - start_time) * 1000
-            
-            if isinstance(result, Parallel):
-                await self._handle_parallel_start(event.agent_id, ctx, result, duration)
-            elif isinstance(result, Schedule):
-                await self._handle_schedule(event.agent_id, current_node_name, ctx, result, duration)
-            elif result:
-                await self._handle_transition(event.agent_id, current_node_name, result, ctx, duration)
-            else:
-                await self._handle_terminal(event.agent_id, current_node_name, ctx, duration)
-                
-            locked = False 
-            
-        except Exception as e:
-            await self.observer.on_error(event.agent_id, current_node_name, e)
-            raise
-        finally:
-            if locked:
-                await self.db.unlock_agent(event.agent_id)
-
-    # Remaining _handle_* methods use self._registry and self.validate_graph
-    async def _handle_transition(self, agent_id: str, from_node: str, next_node_cls: Type[Node], ctx: BaseModel, duration: float):
-        next_name = next_node_cls.get_node_name()
-        if next_name not in self._registry:
-            raise RuntimeError(f"Transition target '{next_name}' not in registry.")
-            
-        await self.observer.on_transition(agent_id, from_node, next_name, duration)
-        next_event = Event(agent_id=agent_id, node_name=next_name)
-        await self.db.save_state(agent_id, next_name, ctx.model_dump(), next_event)
-        await self.bus.publish(next_event)
-
-    async def _handle_parallel_start(self, parent_id: str, parent_ctx: BaseModel, parallel: Parallel, duration: float):
-        join_name = parallel.join_node.get_node_name()
-        await self.observer.on_transition(parent_id, "ParallelStart", join_name, duration)
-        await self.db.create_task_group(parent_id=parent_id, join_node_name=join_name, task_count=len(parallel.branches))
-        
-        for task in parallel.branches:
-            if not hasattr(parent_ctx, task.sub_context_path):
-                raise RuntimeError(f"Context missing path: '{task.sub_context_path}'.")
-                
-            sub_ctx = getattr(parent_ctx, task.sub_context_path)
-            sub_id = f"{parent_id}#{task.sub_context_path}"
-            node_name = task.node_cls.get_node_name()
-            
-            evt = Event(
-                agent_id=sub_id, 
-                node_name=node_name,
-                payload=task.payload.model_dump() if hasattr(task.payload, "model_dump") else task.payload
-            )
-            await self.db.save_sub_state(sub_id, parent_id, node_name, sub_ctx.model_dump(), evt)
-            await self.bus.publish(evt)
-            
-        await self.db.save_state(parent_id, "WAITING_FOR_JOIN", parent_ctx.model_dump(), None)
-
-    async def _handle_terminal(self, agent_id: str, from_node: str, ctx: BaseModel, duration: float):
-        await self.observer.on_transition(agent_id, from_node, "TERMINAL", duration)
-        if "#" in agent_id:
-            parent_id = agent_id.split("#")[0]
-            await self.db.save_sub_state(agent_id, parent_id, "TERMINAL", ctx.model_dump(), None)
-            join_node_name = await self.db.register_sub_task_completion(agent_id)
-            if join_node_name:
-                await self._trigger_recompose(parent_id, join_node_name)
-        else:
-            await self.db.save_state(agent_id, "TERMINAL", ctx.model_dump(), None)
-
-    async def _handle_schedule(self, agent_id: str, from_node: str, ctx: BaseModel, schedule: Schedule, duration: float):
-        target_name = schedule.node_cls.get_node_name()
-        await self.observer.on_transition(agent_id, from_node, f"SCHEDULED:{target_name}", duration)
-        run_at_dt = datetime.now(timezone.utc) + timedelta(seconds=schedule.delay_seconds)
-        
         evt = Event(
-            agent_id=agent_id, 
-            node_name=target_name,
-            payload=schedule.payload.model_dump() if hasattr(schedule.payload, "model_dump") else schedule.payload,
-            run_at=run_at_dt.isoformat(),
-            idempotency_key=schedule.idempotency_key
+            agent_id=agent_id,
+            node_name=node_name,
+            payload=payload.model_dump() if hasattr(payload, "model_dump") else payload,
         )
-        
-        scheduled = await self.db.schedule_event(evt)
-        next_node = target_name if scheduled else "TERMINAL"
-        
-        if "#" in agent_id:
-            parent_id = agent_id.split("#")[0]
-            await self.db.save_sub_state(agent_id, parent_id, next_node, ctx.model_dump(), None)
-            if not scheduled:
-                join_node_name = await self.db.register_sub_task_completion(agent_id)
-                if join_node_name:
-                    await self._trigger_recompose(parent_id, join_node_name)
-        else:
-            await self.db.save_state(agent_id, next_node, ctx.model_dump(), None)
+        await self.db.save_state(agent_id, node_name, initial_context.model_dump(), evt)
+        await self.bus.publish(evt)
 
     async def _trigger_recompose(self, parent_id: str, join_node_name: str):
         await self.db.load_and_lock_agent(parent_id)
         merged_ctx_dict = await self.db.recompose_parent(parent_id)
-        join_event = Event(agent_id=parent_id, node_name=join_node_name)
-        await self.db.save_state(parent_id, join_node_name, merged_ctx_dict, join_event)
-        await self.bus.publish(join_event)
+        await self._apply_target(
+            parent_id, merged_ctx_dict, self._registry[join_node_name]
+        )
+
+    def validate_graph(self, start_node: Type[Node]):
+        return GraphAnalyzer.validate(start_node, self._registry)

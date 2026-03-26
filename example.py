@@ -1,5 +1,5 @@
 import asyncio
-from typing import Dict, Optional, Tuple, Callable, Coroutine, List
+from typing import Dict, Optional, Tuple, Callable, Coroutine, List, Any
 from datetime import datetime, timezone
 from pydantic import BaseModel
 
@@ -16,6 +16,7 @@ class InMemoryDB(Persistence):
         self.task_groups: Dict[str, Dict] = {}  
         self.locks: Dict[str, asyncio.Lock] = {}
         self._global_lock = asyncio.Lock()
+        self.waiting_room: Dict[str, List[Dict]] = {}
         
         self.scheduled_queue: List[Event] = []
         self.idempotency_store = set()
@@ -90,6 +91,18 @@ class InMemoryDB(Persistence):
         self.scheduled_queue = [evt for evt in self.scheduled_queue if datetime.fromisoformat(evt.run_at) > now]
         return due
 
+    async def park_agent(self, agent_id: str, signal_id: str, next_target: Any, context: Dict):
+        if signal_id not in self.waiting_room: self.waiting_room[signal_id] = []
+        self.waiting_room[signal_id].append({
+            "agent_id": agent_id,
+            "next_target": next_target,
+            "context": context
+        })
+        await self.unlock_agent(agent_id)
+
+    async def get_and_clear_waiters(self, signal_id: str) -> List[Dict]:
+        return self.waiting_room.pop(signal_id, [])
+
 class InMemoryBus(EventBus):
     def __init__(self):
         # Adding backpressure to protect the event loop memory
@@ -137,7 +150,7 @@ class DuplicateTestNode(Node[PingCtx, None]):
     async def run(self, ctx: PingCtx, payload=None) -> Schedule:
         print("🏓 [DUPE TEST] Attempting to schedule duplicate pong...")
         return Schedule(
-            node_cls=PongNode,
+            action=PongNode,
             delay_seconds=1,
             payload=PongMessage(text="I should be blocked!"),
             idempotency_key="pong_round_1"
@@ -148,7 +161,7 @@ class PingNode(Node[PingCtx, None]):
         ctx.ping_count += 1
         print(f"🏓 [PING] Scheduling a Pong for 2 seconds from now...")
         return Schedule(
-            node_cls=DuplicateTestNode, 
+            action=DuplicateTestNode, 
             delay_seconds=2,
             idempotency_key="pong_round_1"
         )
