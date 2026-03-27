@@ -1,6 +1,6 @@
 [project]
 name = "commandnet"
-version = "0.3.0"
+version = "0.4.0"
 description = "A lightweight, Pydantic-powered, distributed event-driven state machine and typed node graph runtime."
 authors = [
     { name = "Christopher Vaz", email = "christophervaz160@gmail.com" }
@@ -41,3 +41,4 @@ build-backend = "poetry.core.masonry.api"
 asyncio_mode = "strict"
 asyncio_default_test_loop_scope = "function"
 asyncio_default_fixture_loop_scope = "function"
+

@@ -30,7 +30,7 @@ pip install commandnet
 ## 🛠️ Quick Start
 
 ### 1. Define Your Context
-The "Context" is the persistent state of your agent, defined using Pydantic.
+The "Context" is the persistent state of your subject, defined using Pydantic.
 
 ```python
 from pydantic import BaseModel
@@ -116,7 +116,7 @@ engine = Engine(persistence=db, event_bus=bus)
 await engine.start_worker()
 
 # Trigger an execution
-await engine.trigger_agent("agent-123", CheckRisk, WorkflowCtx(user_id="user_abc"))
+await engine.trigger_subject("subject-123", CheckRisk, WorkflowCtx(user_id="user_abc"))
 ```
 
 ---
@@ -148,3 +148,4 @@ print(dag) # {'CheckRisk': ['ProcessPayment'], 'ProcessPayment': []}
 ## 📄 License
 
 MIT
+

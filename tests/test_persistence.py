@@ -9,14 +9,14 @@ async def test_db_locking():
     
     await db.save_state("a1", "Start", {"val": 1}, None)
     
-    node, ctx = await db.load_and_lock_agent("a1")
+    node, ctx = await db.lock_and_load("a1")
     assert node == "Start"
     assert ctx["val"] == 1
     
     assert "a1" in db.locks
     assert db.locks["a1"].locked() is True
     
-    # Save state triggers unlock_agent
+    # Save state triggers unlock_subject
     await db.save_state("a1", "Next", {"val": 2}, None)
     assert db.locks["a1"].locked() is False
 
@@ -30,4 +30,5 @@ async def test_db_recompose():
     
     merged = await db.recompose_parent("p1")
     assert merged["sub1"]["v"] == 99
-    assert "p1#sub1" not in db.sub_agents
+    assert "p1#sub1" not in db.sub_subjects
+

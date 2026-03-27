@@ -51,3 +51,4 @@ def test_static_validation_missing_node():
     incomplete_registry = {"TestStart": TestStart} # Missing TestMid/TestFinal
     with pytest.raises(RuntimeError, match="references unknown node"):
         GraphAnalyzer.validate(TestStart, incomplete_registry)
+

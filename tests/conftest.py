@@ -5,38 +5,45 @@ from typing import Any, Dict, List, Any
 
 class TestDB(Persistence):
     def __init__(self):
-        self.agents = {}
-        self.sub_agents = {}
+        self.subjects = {}
+        self.sub_subjects = {}
         self.task_groups = {}
         self.locks = {}
-        self.waiting_room: Dict[str, List[Dict]] = {}
-        
-    async def _get_lock(self, agent_id: str):
-        if agent_id not in self.locks:
-            self.locks[agent_id] = asyncio.Lock()
-        return self.locks[agent_id]
+        self.waiting_room = {}
+        self.cancel_flags = {}
+        self.call_groups = {}
 
-    async def load_and_lock_agent(self, agent_id: str):
-        lock = await self._get_lock(agent_id)
+        
+    async def _get_lock(self, subject_id: str):
+        if subject_id not in self.locks:
+            self.locks[subject_id] = asyncio.Lock()
+        return self.locks[subject_id]
+
+    async def lock_and_load(self, subject_id: str):
+        lock = await self._get_lock(subject_id)
         await lock.acquire()
-        agent = self.sub_agents.get(agent_id) if "#" in agent_id else self.agents.get(agent_id)
-        if not agent: 
+        
+        # FIX: Virtual shared subjects (call#) live in the main subjects table
+        is_sub = "#" in subject_id and not subject_id.startswith("call#")
+        subject = self.sub_subjects.get(subject_id) if is_sub else self.subjects.get(subject_id)
+        
+        if not subject: 
             lock.release()
             return None, None
-        return agent.get("node"), agent.get("context")
+        return subject.get("node"), subject.get("context")
         
-    async def unlock_agent(self, agent_id: str):
-        lock = await self._get_lock(agent_id)
+    async def unlock_subject(self, subject_id: str):
+        lock = await self._get_lock(subject_id)
         if lock.locked(): lock.release()
 
-    async def save_state(self, agent_id: str, node_name: str, context: dict, event: Event):
-        self.agents[agent_id] = {"node": node_name, "context": context}
-        await self.unlock_agent(agent_id)
+    async def save_state(self, subject_id: str, node_name: str, context: dict, event: Event):
+        self.subjects[subject_id] = {"node": node_name, "context": context}
+        await self.unlock_subject(subject_id)
 
     async def save_sub_state(self, sub_id: str, parent_id: str, node_name: str, ctx: dict, evt: Event):
         path = sub_id.split("#")[1]
-        self.sub_agents[sub_id] = {"parent_id": parent_id, "path": path, "node": node_name, "context": ctx}
-        await self.unlock_agent(sub_id)
+        self.sub_subjects[sub_id] = {"parent_id": parent_id, "path": path, "node": node_name, "context": ctx}
+        await self.unlock_subject(sub_id)
 
     async def create_task_group(self, parent_id: str, join_node_name: str, task_count: int):
         self.task_groups[parent_id] = {"join_node": join_node_name, "pending": task_count}
@@ -53,12 +60,12 @@ class TestDB(Persistence):
         return None
 
     async def recompose_parent(self, parent_id: str) -> dict:
-        parent_ctx = self.agents.get(parent_id, {}).get("context", {})
-        for sub_id, data in list(self.sub_agents.items()):
+        parent_ctx = self.subjects.get(parent_id, {}).get("context", {})
+        for sub_id, data in list(self.sub_subjects.items()):
             if data["parent_id"] == parent_id:
                 parent_ctx[data["path"]] = data["context"]
-                del self.sub_agents[sub_id]
-        self.agents[parent_id] = {"node": "Recomposing", "context": parent_ctx}
+                del self.sub_subjects[sub_id]
+        self.subjects[parent_id] = {"node": "Recomposing", "context": parent_ctx}
         return parent_ctx
 
     async def schedule_event(self, event: Event) -> bool:
@@ -67,17 +74,36 @@ class TestDB(Persistence):
     async def pop_due_events(self) -> list:
         return []
 
-    async def park_agent(self, agent_id: str, signal_id: str, next_target: Any, context: Dict):
+    async def park_subject(self, subject_id: str, signal_id: str, next_target: Any, context: Dict):
         if signal_id not in self.waiting_room: self.waiting_room[signal_id] = []
         self.waiting_room[signal_id].append({
-            "agent_id": agent_id,
+            "subject_id": subject_id,
             "next_target": next_target,
             "context": context
         })
-        await self.unlock_agent(agent_id)
+        await self.unlock_subject(subject_id)
 
     async def get_and_clear_waiters(self, signal_id: str) -> List[Dict]:
         return self.waiting_room.pop(signal_id, [])
+
+    async def set_cancel_flag(self, subject_id: str, hard: bool):
+        self.cancel_flags[subject_id] = hard
+
+    async def is_cancelled(self, subject_id: str):
+        return subject_id in self.cancel_flags
+
+    async def add_call_waiter(self, key, subject_id, resume_target, context):
+        is_new = key not in self.call_groups
+        if is_new: self.call_groups[key] = []
+        self.call_groups[key].append({
+            "subject_id": subject_id, 
+            "resume_target": resume_target, 
+            "context": context
+        })
+        return is_new
+
+    async def resolve_call_group(self, key):
+        return self.call_groups.pop(key, [])
 
 class TestBus(EventBus):
     def __init__(self):
@@ -119,3 +145,4 @@ async def mock_infrastructure():
     bus = TestBus()
     yield db, bus
     await bus.stop()
+

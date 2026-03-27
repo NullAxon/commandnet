@@ -10,3 +10,4 @@ class EventBus(ABC):
     @abstractmethod
     async def subscribe(self, handler: Callable[[Event], Coroutine]):
         pass
+

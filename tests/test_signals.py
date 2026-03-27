@@ -27,7 +27,7 @@ async def test_chained_signals(mock_infrastructure):
     db, bus = mock_infrastructure
     engine = Engine(persistence=db, event_bus=bus, nodes=[WaitChainNode, SuccessNode])
     await engine.start_worker()
-    await engine.trigger_agent("a1", WaitChainNode, SignalCtx())
+    await engine.trigger_subject("a1", WaitChainNode, SignalCtx())
     await asyncio.sleep(0.1) 
     assert "sig-1" in db.waiting_room
     assert len(db.waiting_room["sig-1"]) == 1
@@ -36,7 +36,7 @@ async def test_chained_signals(mock_infrastructure):
     assert "sig-2" in db.waiting_room
     await engine.release_signal("sig-2")
     await asyncio.sleep(0.1) # Process terminal
-    assert db.agents["a1"]["context"]["step"] == 99
+    assert db.subjects["a1"]["context"]["step"] == 99
     await engine.stop()
 
 
@@ -58,10 +58,11 @@ async def test_parallel_wait_shorthand(mock_infrastructure):
 
     engine = Engine(persistence=db, event_bus=bus, nodes=[ParallelWaitNode, SuccessNode])
     await engine.start_worker() # CRITICAL
-    await engine.trigger_agent("p1", ParallelWaitNode, MultiCtx())
+    await engine.trigger_subject("p1", ParallelWaitNode, MultiCtx())
     await asyncio.sleep(0.1) # Allow node to run and branches to park
     assert "p-sig" in db.waiting_room
     await engine.release_signal("p-sig")
     await asyncio.sleep(0.1) 
-    assert db.agents["p1"]["node"] == "TERMINAL"
+    assert db.subjects["p1"]["node"] == "TERMINAL"
     await engine.stop()
+

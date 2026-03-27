@@ -23,11 +23,12 @@ async def test_engine_execution_flow(mock_infrastructure):
     await engine.start_worker()
 
     ctx = SimpleCtx()
-    await engine.trigger_agent("agent-test-1", TestSimpleStartNode, ctx)
+    await engine.trigger_subject("subject-test-1", TestSimpleStartNode, ctx)
     
     await asyncio.sleep(0.1)
     
-    agent_data = db.agents.get("agent-test-1")
-    assert agent_data is not None
-    assert agent_data["node"] == "TERMINAL" 
-    assert agent_data["context"]["val"] == 2
+    subject_data = db.subjects.get("subject-test-1")
+    assert subject_data is not None
+    assert subject_data["node"] == "TERMINAL" 
+    assert subject_data["context"]["val"] == 2
+
