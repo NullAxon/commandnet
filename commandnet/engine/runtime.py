@@ -165,7 +165,6 @@ class Engine:
                 key = subject_id.split("#")[1]
                 waiters = await self.db.resolve_call_group(key)
                 for w in waiters:
-                    # Resume waiters using the final context of the shared node as payload
                     await self._apply_target(
                         w["subject_id"],
                         w["context"],
@@ -191,13 +190,23 @@ class Engine:
             node_name = target.get_node_name()
             await self.observer.on_transition(subject_id, "RUN", node_name, duration)
 
+            # PROPAGATION: Use provided payload
             p_load = payload.model_dump() if hasattr(payload, "model_dump") else payload
-            evt = Event(subject_id=subject_id, node_name=node_name, payload=p_load)
+
+            evt = Event(
+                subject_id=subject_id,
+                node_name=node_name,
+                payload=p_load,
+            )
             ctx_dict = self._dump_ctx(context)
 
             if "#" in subject_id:
                 await self.db.save_sub_state(
-                    subject_id, subject_id.split("#")[0], node_name, ctx_dict, evt
+                    subject_id,
+                    subject_id.split("#")[0],
+                    node_name,
+                    ctx_dict,
+                    evt,
                 )
             else:
                 await self.db.save_state(subject_id, node_name, ctx_dict, evt)
@@ -209,6 +218,7 @@ class Engine:
         if isinstance(target, Wait):
             actual_id = subject_id
             actual_ctx = context
+
             if target.sub_context_path and "#" not in subject_id:
                 actual_id = f"{subject_id}#{target.sub_context_path}"
                 actual_ctx = self._get_path(context, target.sub_context_path)
@@ -216,6 +226,7 @@ class Engine:
             await self.observer.on_transition(
                 actual_id, "RUN", f"WAIT:{target.signal_id}", duration
             )
+
             await self.db.park_subject(
                 actual_id,
                 target.signal_id,
@@ -226,7 +237,12 @@ class Engine:
 
         # 6. Parallel Fan-out
         if isinstance(target, Parallel):
-            join_name = target.join_node.get_node_name() if target.join_node else "FORK"
+            join_name = (
+                target.join_node.get_node_name()
+                if target.join_node
+                else "FORK"
+            )
+
             await self.observer.on_transition(
                 subject_id, "RUN", f"PARALLEL:{join_name}", duration
             )
@@ -237,11 +253,10 @@ class Engine:
                 )
 
             for branch in target.branches:
-                # Normalize branch to ParallelTask without stripping Wait wrappers
+                # Normalize branch into ParallelTask
                 if isinstance(branch, ParallelTask):
                     task = branch
                 else:
-                    # If it's a Wait or a Node class, wrap it but keep the action intact
                     path = (
                         branch.sub_context_path
                         if isinstance(branch, Wait) and branch.sub_context_path
@@ -249,30 +264,42 @@ class Engine:
                     )
                     task = ParallelTask(action=branch, sub_context_path=path)
 
+                # PROPAGATION: fallback to incoming payload if branch has none
+                branch_payload = (
+                    task.payload if task.payload is not None else payload
+                )
+
                 sub_ctx = self._get_path(context, task.sub_context_path)
+
                 await self._apply_target(
                     f"{subject_id}#{task.sub_context_path}",
                     sub_ctx,
                     task.action,
-                    payload=task.payload,
+                    payload=branch_payload,
                 )
 
             if target.join_node:
                 await self.db.save_state(
-                    subject_id, "WAITING_FOR_JOIN", self._dump_ctx(context), None
+                    subject_id,
+                    "WAITING_FOR_JOIN",
+                    self._dump_ctx(context),
+                    None,
                 )
             else:
                 await self._apply_target(subject_id, context, None)
+
             return
 
         # 7. Schedule (Delayed Execution)
         if isinstance(target, Schedule):
             if not (
-                isinstance(target.action, type) and issubclass(target.action, Node)
+                isinstance(target.action, type)
+                and issubclass(target.action, Node)
             ):
                 raise TypeError("Schedule.action must be a Node class.")
 
             target_node_name = target.action.get_node_name()
+
             await self.observer.on_transition(
                 subject_id, "RUN", f"SCHEDULED:{target_node_name}", duration
             )
@@ -280,10 +307,16 @@ class Engine:
             run_at_dt = datetime.now(timezone.utc) + timedelta(
                 seconds=target.delay_seconds
             )
+
+            # PROPAGATION: fallback to incoming payload if schedule payload is missing
+            final_payload = (
+                target.payload if target.payload is not None else payload
+            )
+
             p_load = (
-                target.payload.model_dump()
-                if hasattr(target.payload, "model_dump")
-                else target.payload
+                final_payload.model_dump()
+                if hasattr(final_payload, "model_dump")
+                else final_payload
             )
 
             scheduled_evt = Event(
@@ -296,10 +329,12 @@ class Engine:
 
             await self.db.schedule_event(scheduled_evt)
             await self.db.save_state(
-                subject_id, target_node_name, self._dump_ctx(context), None
+                subject_id,
+                target_node_name,
+                self._dump_ctx(context),
+                None,
             )
             return
-
     # --- EXTERNAL CONTROL & SIGNALS ---
 
     async def signal_node(self, subject_id: str, signal_id: str, payload: Any = None):
