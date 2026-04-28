@@ -70,8 +70,10 @@ class Engine:
 
     async def _run_node_logic(self, event: Event):
         subject_id = event.subject_id
-        # We allow "AWAITING_CALL" because an subject wakes up from that state when a 'Call' resolves
+
+        # 1. READ & LOCK
         node_name, ctx_dict = await self.db.lock_and_load(subject_id)
+
         if not node_name or (
             node_name != event.node_name and node_name != "AWAITING_CALL"
         ):
@@ -92,32 +94,41 @@ class Engine:
                 if hasattr(ctx_type, "model_validate")
                 else ctx_dict
             )
+
             payload = (
                 payload_type.model_validate(event.payload)
                 if (event.payload and hasattr(payload_type, "model_validate"))
                 else event.payload
             )
 
-            # Support Soft-Cancel checking inside Node.run
+            # Soft cancel check BEFORE compute
             if hasattr(ctx, "is_cancelled"):
                 ctx.is_cancelled = await self.db.is_cancelled(subject_id)
 
+            # 2. RELEASE LOCK before long-running compute
+            await self.db.unlock_subject(subject_id)
+
+            # 3. COMPUTE (no DB lock held)
             start_t = asyncio.get_event_loop().time()
             result = await node_cls().run(ctx, payload)
+            duration = (asyncio.get_event_loop().time() - start_t) * 1000
 
-            await self._apply_target(
-                subject_id,
-                ctx,
-                result,
-                (asyncio.get_event_loop().time() - start_t) * 1000,
-            )
+            # 4. RE-LOCK before writing
+            node_name_check, _ = await self.db.lock_and_load(subject_id)
+
+            # 🔴 IMPORTANT SAFETY CHECK (prevents stale writes)
+            if node_name_check != event.node_name and node_name_check != "AWAITING_CALL":
+                await self.db.unlock_subject(subject_id)
+                return
+
+            await self._apply_target(subject_id, ctx, result, duration)
+
         except Exception as e:
             await self.observer.on_error(subject_id, event.node_name, e)
             raise
         finally:
+            # Ensure we never leave a lock hanging
             await self.db.unlock_subject(subject_id)
-
-    # --- RECURSIVE TARGET RESOLVER ---
 
     async def _apply_target(
         self,
