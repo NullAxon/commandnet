@@ -5,7 +5,7 @@ C = TypeVar('C', bound=BaseModel) # Context
 P = TypeVar('P', bound=BaseModel) # Payload
 
 # The Recursive Type Definition
-Target = Union[Type['Node'], 'Parallel', 'Schedule', 'Wait', 'Call', 'Interrupt', None]
+Target = Union[Type['Node'], 'Parallel', 'Schedule', 'Wait', 'Call', 'Interrupt', 'Transition', None]
 
 class ParallelTask(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)
@@ -30,6 +30,11 @@ class Wait(BaseModel):
     signal_id: str
     resume_action: Target
     sub_context_path: Optional[str] = None 
+
+class Transition(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+    node_cls: Type['Node']
+    payload: Optional[Any] = None
 
 class Call(BaseModel):
     """The 'Await' type: Deduplicates execution based on an idempotency key."""

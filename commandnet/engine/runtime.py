@@ -8,6 +8,7 @@ from ..core.node import (
     Node,
     Parallel,
     Schedule,
+    Transition,
     Wait,
     Target,
     ParallelTask,
@@ -345,6 +346,20 @@ class Engine:
                 self._dump_ctx(context),
                 None,
             )
+            return
+        if isinstance(target, Transition):
+            node_name = target.node_cls.get_node_name()
+            await self.observer.on_transition(subject_id, "RUN", node_name, duration)
+            
+            # Use the transition's payload, or fallback to the current one
+            final_payload = target.payload if target.payload is not None else payload
+            p_load = final_payload.model_dump() if hasattr(final_payload, "model_dump") else final_payload
+
+            evt = Event(subject_id=subject_id, node_name=node_name, payload=p_load)
+            ctx_dict = self._dump_ctx(context)
+            
+            await self.db.save_state(subject_id, node_name, ctx_dict, evt)
+            await self.bus.publish(evt)
             return
     # --- EXTERNAL CONTROL & SIGNALS ---
 
