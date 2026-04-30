@@ -106,22 +106,15 @@ class Engine:
             if hasattr(ctx, "is_cancelled"):
                 ctx.is_cancelled = await self.db.is_cancelled(subject_id)
 
-            # 2. RELEASE LOCK before long-running compute
-            await self.db.unlock_subject(subject_id)
-
-            # 3. COMPUTE (no DB lock held)
+            # 2. COMPUTE (Lock is HELD via Redis during compute)
             start_t = asyncio.get_event_loop().time()
-            result = await node_cls().run(ctx, payload)
+            try:
+                result = await node_cls().run(ctx, payload)
+            except asyncio.CancelledError:
+                self.logger.warning(f"Task {subject_id} cancelled during compute. Emitting Interrupt.")
+                result = Interrupt(subject_id=subject_id, hard=True)
+                
             duration = (asyncio.get_event_loop().time() - start_t) * 1000
-
-            # 4. RE-LOCK before writing
-            node_name_check, _ = await self.db.lock_and_load(subject_id)
-
-            # 🔴 IMPORTANT SAFETY CHECK (prevents stale writes)
-            if node_name_check != event.node_name and node_name_check != "AWAITING_CALL":
-                await self.db.unlock_subject(subject_id)
-                return
-
             await self._apply_target(subject_id, ctx, result, duration)
 
         except Exception as e:
@@ -264,19 +257,7 @@ class Engine:
                     subject_id, join_name, len(target.branches)
                 )
 
-            for branch in target.branches:
-                # Normalize branch into ParallelTask
-                if isinstance(branch, ParallelTask):
-                    task = branch
-                else:
-                    path = (
-                        branch.sub_context_path
-                        if isinstance(branch, Wait) and branch.sub_context_path
-                        else "default"
-                    )
-                    task = ParallelTask(action=branch, sub_context_path=path)
-
-                # PROPAGATION: fallback to incoming payload if branch has none
+            async def _run_branch(task: ParallelTask):
                 branch_payload = (
                     task.payload if task.payload is not None else payload
                 )
@@ -289,6 +270,25 @@ class Engine:
                     task.action,
                     payload=branch_payload,
                 )
+
+            branch_tasks = []
+
+            for branch in target.branches:
+                # Normalize branch into ParallelTask
+                if isinstance(branch, ParallelTask):
+                    task = branch
+                else:
+                    path = (
+                        branch.sub_context_path
+                        if isinstance(branch, Wait) and branch.sub_context_path
+                        else "default"
+                    )
+                    task = ParallelTask(action=branch, sub_context_path=path)
+
+                branch_tasks.append(asyncio.create_task(_run_branch(task)))
+
+            if branch_tasks:
+                await asyncio.gather(*branch_tasks)
 
             if target.join_node:
                 await self.db.save_state(
