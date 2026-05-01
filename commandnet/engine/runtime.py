@@ -115,7 +115,8 @@ class Engine:
                 result = Interrupt(subject_id=subject_id, hard=True)
                 
             duration = (asyncio.get_event_loop().time() - start_t) * 1000
-            await self._apply_target(subject_id, ctx, result, duration)
+            
+            await self._apply_target(subject_id, ctx, result, duration, payload=payload) 
 
         except Exception as e:
             await self.observer.on_error(subject_id, event.node_name, e)
@@ -379,7 +380,7 @@ class Engine:
             )
 
             result = await node_inst.on_signal(ctx, signal_id, payload)
-            await self._apply_target(subject_id, ctx, result)
+            await self._apply_target(subject_id, ctx, result, payload=payload)
         finally:
             await self.db.unlock_subject(subject_id)
 
