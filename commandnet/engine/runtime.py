@@ -48,7 +48,12 @@ class Engine:
     # --- CORE WORKER LOGIC ---
 
     async def process_event(self, event: Event):
-        # 1. Internal Control (Cross-worker Hard Cancel)
+        if event.node_name == "__SIGNAL_RELEASE__":
+            signal_id = event.payload.get("signal_id")
+            signal_data = event.payload.get("data")
+            await self._handle_distributed_signal(signal_id, signal_data)
+            return
+
         if event.node_name == "__CONTROL__":
             action = (event.payload or {}).get("action")
             if action == "HARD_CANCEL" and event.subject_id in self._active_tasks:
@@ -68,6 +73,25 @@ class Engine:
             self.logger.warning(f"Task {event.subject_id} hard-cancelled.")
         finally:
             self._active_tasks.pop(event.subject_id, None)
+
+    async def _handle_distributed_signal(self, signal_id: str, payload: Any):
+        """
+        One worker picks up the signal release event and converts 
+        parked subjects into active events.
+        """
+        # 1. Find all subjects waiting on this signal in the DB
+        waiters = await self.db.get_and_clear_waiters(signal_id)
+        
+        for waiter in waiters:
+            subject_id = waiter["subject_id"]
+            # 2. For each waiter, trigger a standard resume turn
+            # This puts a specific task-event back on the RabbitMQ queue
+            await self._apply_target(
+                subject_id=subject_id,
+                context=waiter["context"],
+                target=waiter["next_target"],
+                payload=payload
+            )
 
     async def _run_node_logic(self, event: Event):
         subject_id = event.subject_id
@@ -385,20 +409,19 @@ class Engine:
             await self.db.unlock_subject(subject_id)
 
     async def release_signal(self, signal_id: str, payload: Any = None):
-        """Standard mass-resume for parked subjects."""
-        waiters = await self.db.get_and_clear_waiters(signal_id)
-        for waiter in waiters:
-            subject_id = waiter["subject_id"]
-            await self.db.lock_and_load(subject_id)
-            try:
-                await self._apply_target(
-                    subject_id=subject_id,
-                    context=waiter["context"],
-                    target=waiter["next_target"],
-                    payload=payload,
-                )
-            finally:
-                await self.db.unlock_subject(subject_id)
+        """
+        NEW: Instead of processing locally, broadcast the signal 
+        to the entire cluster via the EventBus.
+        """
+        sig_event = Event(
+            subject_id="__GLOBAL__",
+            node_name="__SIGNAL_RELEASE__",
+            payload={
+                "signal_id": signal_id,
+                "data": payload
+            }
+        )
+        await self.bus.publish(sig_event)
 
     async def cancel_subject(self, subject_id: str, hard: bool = True):
         await self.db.set_cancel_flag(subject_id, hard)

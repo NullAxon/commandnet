@@ -1,6 +1,6 @@
 [project]
 name = "commandnet"
-version = "0.6.2"
+version = "0.6.3"
 description = "A lightweight, Pydantic-powered, distributed event-driven state machine and typed node graph runtime."
 authors = [
     { name = "Christopher Vaz", email = "christophervaz160@gmail.com" }
