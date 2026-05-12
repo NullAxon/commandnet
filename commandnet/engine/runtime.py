@@ -439,11 +439,14 @@ class Engine:
     # --- LIFECYCLE & HELPERS ---
 
     async def _trigger_recompose(self, parent_id: str, join_node_name: str):
-        await self.db.lock_and_load(parent_id)
-        merged_ctx_dict = await self.db.recompose_parent(parent_id)
-        await self._apply_target(
-            parent_id, merged_ctx_dict, self._registry[join_node_name]
-        )
+        try:
+            await self.db.lock_and_load(parent_id)
+            merged_ctx_dict = await self.db.recompose_parent(parent_id)
+            await self._apply_target(
+                parent_id, merged_ctx_dict, self._registry[join_node_name]
+            )
+        finally:
+            await self.db.unlock_subject(parent_id)
 
     async def start_worker(self, poll_interval: float = 1.0):
         await self.bus.subscribe(self.process_event)
