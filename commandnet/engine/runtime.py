@@ -439,14 +439,22 @@ class Engine:
     # --- LIFECYCLE & HELPERS ---
 
     async def _trigger_recompose(self, parent_id: str, join_node_name: str):
-        try:
-            await self.db.lock_and_load(parent_id)
-            merged_ctx_dict = await self.db.recompose_parent(parent_id)
-            await self._apply_target(
-                parent_id, merged_ctx_dict, self._registry[join_node_name]
-            )
-        finally:
-            await self.db.unlock_subject(parent_id)
+        # 1. Lock and Merge Parent Context
+        await self.db.lock_and_load(parent_id)
+        merged_ctx_dict = await self.db.recompose_parent(parent_id)
+        
+        # 2. Explicitly Prepare Transition
+        target_node = self._registry[join_node_name]
+        node_name = target_node.get_node_name()
+        evt = Event(subject_id=parent_id, node_name=node_name)
+
+        # 3. Save and UNLOCK BEFORE PUBLISHING
+        # This clears the way for the worker that picks up the event
+        await self.db.save_state(parent_id, node_name, merged_ctx_dict, evt)
+        await self.db.unlock_subject(parent_id) 
+
+        # 4. Now send the signal to wake the parent back up
+        await self.bus.publish(evt)
 
     async def start_worker(self, poll_interval: float = 1.0):
         await self.bus.subscribe(self.process_event)
